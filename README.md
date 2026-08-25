@@ -198,18 +198,3 @@ Do not commit:
 
 If a secret has already been exposed, revoke or rotate it before publishing the repository.
 
-## 🔮 Future Improvements
-
-- Authentication and user accounts
-- PostgreSQL production database
-- Redis-based session/cache layer
-- More advanced RAG with reranking
-- EDA agent
-- Machine-learning agent
-- SQL agent
-- Model comparison agent
-- Hyperparameter tuning agent
-- Docker deployment
-- CI/CD pipeline
-- Cloud deployment
-- Agent observability and evaluation
