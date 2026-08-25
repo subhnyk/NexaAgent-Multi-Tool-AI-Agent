@@ -185,16 +185,6 @@ AI-Agent-Chatbot/
 └── LICENSE
 ```
 
-## ⚠️ Security
-
-Do not commit:
-
-- `.env`
-- API keys
-- GitHub tokens
-- LangSmith keys
-- SQLite databases
-- uploaded private documents
 
 If a secret has already been exposed, revoke or rotate it before publishing the repository.
 
