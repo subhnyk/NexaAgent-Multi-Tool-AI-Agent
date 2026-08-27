@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local DB and runtime artifacts
+chatbot.db
+chatbot.db-shm
+chatbot.db-wal
+
+# Secrets
+.env
+
+# Uploads and generated files
+uploads/
+generated/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+
+# Local backups (created during this merge)
+.local-backup/
