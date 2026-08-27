@@ -22,7 +22,7 @@ The application combines conversational AI, tool calling, persistent chat histor
 - ⚡ Streaming assistant responses
 - 📎 File uploads through Streamlit
 
-## 🏗️ Architecture
+## Architecture
 
 ```text
 User
