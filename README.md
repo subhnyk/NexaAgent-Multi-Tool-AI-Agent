@@ -1,4 +1,4 @@
-# 🤖 AI Agent Chatbot
+# 🤖 Nexa Agent
 
 A resume-ready AI Agent Chatbot built with **LangGraph, Gemini, LangChain and Streamlit**.
 
