@@ -14,6 +14,8 @@ from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.tools import tool
 import sqlite3
 import requests
+import contextvars
+from contextlib import contextmanager
 
 import tempfile
 
@@ -89,6 +91,22 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
 _THREAD_RETRIEVERS: Dict[str, Any] = {}
 _THREAD_METADATA: Dict[str, dict] = {}
 
+# Tracks the active chat thread so tools that need per-thread state (e.g. the
+# PDF retriever) can resolve the right one. The frontend sets this via
+# `set_current_thread_id` before invoking the graph for a turn.
+current_thread_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "current_thread_id", default=None
+)
+
+
+@contextmanager
+def set_current_thread_id(thread_id: Optional[str]):
+    token = current_thread_id.set(str(thread_id) if thread_id is not None else None)
+    try:
+        yield
+    finally:
+        current_thread_id.reset(token)
+
     
 # -----------------------------------------------------------------------------------
 # my tools 
@@ -124,11 +142,17 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
 @tool
 def get_stock_price(symbol: str) -> dict:
     """
-    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
-    using Alpha Vantage with API key in the URL.
+    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')
+    using Alpha Vantage with API key from the ALPHAVANTAGE_API_KEY env var.
     """
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=8KOIVWKSXZHREVSX"
-    r = requests.get(url)
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        return {"error": "ALPHAVANTAGE_API_KEY is not set in the environment."}
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
+    )
+    r = requests.get(url, timeout=10)
     return r.json()
 
 import pymupdf
@@ -189,14 +213,21 @@ def analyze_file(file_path: str) -> dict:
 
 
 import matplotlib.pyplot as plt
+import uuid as _uuid
+
+_OUTPUT_DIR = "generated"
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
 
 @tool
-def create_visualization(file_path: str,column: str,chart_type: str) -> str:
+def create_visualization(file_path: str, column: str, chart_type: str) -> str:
     """
-    Create a visualization from a CSV file.
+    Create a visualization from a CSV file and return its absolute path.
+
+    Each call writes to a fresh file in the 'generated/' directory so concurrent
+    calls do not clobber each other.
     """
     try:
-
         df = pd.read_csv(file_path)
 
         plt.figure(figsize=(10, 6))
@@ -214,10 +245,10 @@ def create_visualization(file_path: str,column: str,chart_type: str) -> str:
             df.boxplot(column=column)
 
         else:
+            plt.close()
             return "Unsupported chart type"
 
-        output = "output_chart.png"
-
+        output = os.path.abspath(os.path.join(_OUTPUT_DIR, f"chart_{_uuid.uuid4().hex[:8]}.png"))
         plt.savefig(output)
         plt.close()
 
@@ -226,20 +257,127 @@ def create_visualization(file_path: str,column: str,chart_type: str) -> str:
     except Exception as e:
         return f"Visualization error: {str(e)}"
 
+import ast
+import signal
+import io
+import contextlib
+
+# Modules the sandbox refuses outright. Kept narrow on purpose: the executor is
+# meant for quick snippets (math, small data transforms), not for shelling out.
+_SANDBOX_DENY_MODULES = {
+    "os", "sys", "subprocess", "shutil", "socket", "http", "urllib",
+    "requests", "ftplib", "smtplib", "ssl", "asyncio", "multiprocessing",
+    "ctypes", "cffi", "importlib", "pkgutil", "pathlib", "glob", "tempfile",
+    "pickle", "shelve", "code", "codeop", "compileall", "py_compile",
+    "webbrowser", "antigravity", "this",
+}
+
+
+class _SandboxTimeout(Exception):
+    pass
+
+
+def _sandbox_alarm(_signum, _frame):
+    raise _SandboxTimeout("Execution exceeded 5s timeout.")
+
+
+def _validate_sandbox_code(code: str) -> str:
+    """Reject code that imports blocked modules or uses dangerous builtins.
+
+    Returns an error message string if the code should be refused, or '' if OK.
+    """
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as e:
+        return f"SyntaxError: {e}"
+
+    for node in ast.walk(tree):
+        # Block 'import x' and 'from x import y' for dangerous modules.
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _SANDBOX_DENY_MODULES:
+                    return f"Import of '{root}' is not allowed in the sandbox."
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                root = node.module.split(".")[0]
+                if root in _SANDBOX_DENY_MODULES:
+                    return f"Import from '{root}' is not allowed in the sandbox."
+
+        # Block dunder access to bypass builtins.
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
+            return f"Access to dunder attribute '{node.attr}' is not allowed."
+
+        # Block file open() and exec()/eval() outright.
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = None
+            if isinstance(func, ast.Name):
+                name = func.id
+            elif isinstance(func, ast.Attribute):
+                name = func.attr
+            if name in {"open", "exec", "eval", "compile", "__import__", "input", "breakpoint"}:
+                return f"Call to '{name}' is not allowed in the sandbox."
+
+    return ""
+
+
+_SAFE_BUILTINS = {
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "complex", "dict", "divmod", "enumerate", "filter",
+    "float", "format", "frozenset", "hash", "hex", "id", "int", "isinstance",
+    "issubclass", "iter", "len", "list", "map", "max", "min", "next", "object",
+    "oct", "ord", "pow", "print", "range", "repr", "reversed", "round",
+    "set", "slice", "sorted", "str", "sum", "tuple", "type", "vars", "zip",
+    "True", "False", "None", "Exception", "ValueError", "TypeError",
+    "KeyError", "IndexError", "RuntimeError", "StopIteration", "ZeroDivisionError",
+    # __import__ is the only path to import statements; the AST gate is what
+    # actually keeps the sandbox safe. It rejects os/subprocess/networking
+    # before any of this runs.
+    "__import__",
+}
+
+
 @tool
 def python_executor(code: str) -> str:
+    """
+    Execute a small Python snippet in a restricted sandbox.
 
+    Imports of os/sys/subprocess/networking and calls to open/exec/eval are
+    rejected. Execution is wall-clock-limited to 5 seconds. The tool captures
+    stdout and returns it so the model can read the result.
     """
-    Execute Python code.
-    """
+    rejection = _validate_sandbox_code(code)
+    if rejection:
+        return rejection
+
+    stdout_buffer = io.StringIO()
+    sandbox_globals = {"__builtins__": {k: __builtins__[k] if isinstance(__builtins__, dict) else getattr(__builtins__, k) for k in _SAFE_BUILTINS}}
+    sandbox_locals: dict = {}
+
+    # SIGALRM is the standard POSIX timeout mechanism. It is not available on
+    # Windows; on Windows we skip the signal and rely on the AST/import checks
+    # for safety.
+    use_signal = hasattr(signal, "SIGALRM") and hasattr(signal, "alarm")
+    previous_handler = None
+    if use_signal:
+        previous_handler = signal.signal(signal.SIGALRM, _sandbox_alarm)
+        signal.alarm(5)
 
     try:
-        exec(code)
-
-        return "Code executed successfully"
-
+        with contextlib.redirect_stdout(stdout_buffer):
+            exec(compile(code, "<sandbox>", "exec"), sandbox_globals, sandbox_locals)
+        output = stdout_buffer.getvalue()
+        return output if output else "Code executed successfully (no output)."
+    except _SandboxTimeout as e:
+        return f"TimeoutError: {e}"
     except Exception as e:
-        return str(e)
+        return f"{type(e).__name__}: {e}"
+    finally:
+        if use_signal:
+            signal.alarm(0)
+            if previous_handler is not None:
+                signal.signal(signal.SIGALRM, previous_handler)
 
     
 
@@ -294,10 +432,53 @@ def find_place(place: str) -> dict:
         return {"error": str(e)}
 
 tools = [search_tool, get_stock_price, calculator, read_pdf, analyze_file, create_visualization, python_executor, github_search, find_place]
+
+
+@tool
+def search_uploaded_pdf(query: str) -> str:
+    """
+    Search the PDF that was uploaded in the current chat thread.
+
+    Returns the top-matching passages from the indexed PDF, or an error if no
+    PDF has been uploaded for this thread yet. Use this when the user asks a
+    question that should be answered from their uploaded document.
+    """
+    thread_id = current_thread_id.get()
+    if not thread_id:
+        return "No active chat thread; cannot resolve a PDF retriever."
+
+    retriever = _get_retriever(thread_id)
+    if retriever is None:
+        meta = _THREAD_METADATA.get(str(thread_id))
+        if meta:
+            return (
+                f"A PDF named '{meta.get('filename')}' was indexed for this thread, "
+                "but the retriever is no longer available (it lives in process "
+                "memory and the backend was likely restarted). Please re-upload."
+            )
+        return "No PDF has been uploaded in this chat yet."
+
+    try:
+        docs = retriever.invoke(query)
+    except Exception as e:
+        return f"Retriever error: {e}"
+
+    if not docs:
+        return "No relevant passages found in the uploaded PDF."
+
+    return "\n\n---\n\n".join(
+        f"[page {getattr(d, 'metadata', {}).get('page', '?')}] {d.page_content}"
+        for d in docs
+    )
+
+
+# Final tools list: includes search_uploaded_pdf so both the LLM and the
+# ToolNode know about it.
+tools = tools + [search_uploaded_pdf]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------------------------------------------------------------------------------------------
-#My State 
+#My State
 from langgraph.graph.message import add_messages
 
 class ChatState(TypedDict):
@@ -319,7 +500,22 @@ tool_node = ToolNode(tools)
 # ---------------------------------------------------------------------------------------------------------------------
 # CHECKPOINTER
 conn = sqlite3.connect(database='chatbot.db', check_same_thread=False)  # Create the database file if it doesn't exist
+# Initialize title persistence table
+conn.execute("CREATE TABLE IF NOT EXISTS thread_titles (thread_id TEXT PRIMARY KEY, title TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+conn.commit()
+
+# Migration: Ensure created_at column exists
+cursor = conn.execute("PRAGMA table_info(thread_titles)")
+columns = [row[1] for row in cursor.fetchall()]
+if "created_at" not in columns:
+    try:
+        conn.execute("ALTER TABLE thread_titles ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
 # check same tread is set to False to allow multiple threads to access the database concurrently.
+
 
 # Checkpointer
 checkpointer = SqliteSaver(conn=conn)
@@ -343,15 +539,28 @@ chatbot = graph.compile(checkpointer=checkpointer)
 # ---------------------------------------------------------------------------
 # helper
 def retrieve_all_threads():
+    """Retrieve all existing chat threads with their creation timestamps."""
     all_threads = set()
-
     for checkpoint in checkpointer.list(None):
         config = checkpoint.config
         thread_id = config.get("configurable", {}).get("thread_id")
         if thread_id:
-            all_threads.add(thread_id)
-    return list(all_threads)
-    # this function retrieves all the existing chat threads from the database by listing all the checkpoints and extracting the unique thread IDs. It returns a list of thread IDs that can be used to manage multiple chat sessions.
+            all_threads.add(str(thread_id))
+
+    results = []
+    for tid in all_threads:
+        try:
+            cursor = conn.execute("SELECT created_at FROM thread_titles WHERE thread_id = ?", (tid,))
+            row = cursor.fetchone()
+            created_at = row[0] if row else None
+        except sqlite3.OperationalError:
+            # Handle case where created_at column might still be missing
+            created_at = None
+        results.append((tid, created_at))
+    return results
+
+    # this function retrieves all the existing chat threads from the database along with their creation timestamps.
+    # It returns a list of (thread_id, created_at) tuples.
 
 
 def thread_has_document(thread_id: str) -> bool:
@@ -360,4 +569,48 @@ def thread_has_document(thread_id: str) -> bool:
 
 def thread_document_metadata(thread_id: str) -> dict:
     return _THREAD_METADATA.get(str(thread_id), {})
+
+def set_thread_title(thread_id: str, title: str):
+    """Persist a custom title for a thread, preserving the creation timestamp."""
+    thread_id_str = str(thread_id)
+    conn.execute(
+        "INSERT INTO thread_titles (thread_id, title) VALUES (?, ?) "
+        "ON CONFLICT(thread_id) DO UPDATE SET title=excluded.title",
+        (thread_id_str, title)
+    )
+    conn.commit()
+
+def get_persisted_title(thread_id: str) -> Optional[str]:
+    """Retrieve a persisted title for a thread."""
+    thread_id_str = str(thread_id)
+    cursor = conn.execute("SELECT title FROM thread_titles WHERE thread_id = ?", (thread_id_str,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+def delete_thread(thread_id: str):
+    """
+    Permanently delete a thread's checkpoints and titles from the database.
+    Uses a robust approach that only attempts deletion from tables that exist.
+    """
+    thread_id_str = str(thread_id)
+
+    # Tables that LangGraph SqliteSaver might use
+    potential_tables = ["checkpoints", "checkpoint_blobs", "writes"]
+
+    for table in potential_tables:
+        try:
+            conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id_str,))
+        except sqlite3.OperationalError:
+            # Table might not exist in this version of LangGraph or hasn't been created yet
+            pass
+
+    # Delete custom title
+    try:
+        conn.execute("DELETE FROM thread_titles WHERE thread_id = ?", (thread_id_str,))
+    except sqlite3.OperationalError:
+        pass
+
+    conn.commit()
+
+
 # python langgraph_backend.py

@@ -17,3 +17,6 @@ PyGithub
 geopy
 python-dotenv
 duckduckgo-search
+
+
+.\.venv\Scripts\python.exe -m streamlit run streamlit_frountend.py
